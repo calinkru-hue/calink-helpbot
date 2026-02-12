@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+support_bot.db
+.DS_Store
+.snapshots/
