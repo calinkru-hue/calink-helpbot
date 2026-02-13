@@ -148,8 +148,14 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     if not message.reply_to_message:
         return  # Обычное сообщение в топике — внутреннее обсуждение, не пересылаем
 
-    # Проверяем, что отвечают на сообщение бота (пересланное от клиента)
     replied_to = message.reply_to_message
+
+    # Игнорируем reply на служебное сообщение о создании топика
+    # (в forum topics ВСЕ сообщения автоматически reply на это сообщение)
+    if replied_to.forum_topic_created:
+        return
+
+    # Проверяем, что отвечают на сообщение бота (пересланное от клиента)
     if not replied_to.from_user or replied_to.from_user.id != context.bot.id:
         return  # Reply на сообщение другого саппорта — не пересылаем
 
