@@ -2,7 +2,9 @@ import aiosqlite
 import os
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "support_bot.db")
+# Railway: volume примонтирован в /data/, локально — рядом с ботом
+DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(DATA_DIR, "support_bot.db")
 
 
 async def init_db():
