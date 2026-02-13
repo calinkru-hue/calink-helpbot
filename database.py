@@ -1,5 +1,6 @@
 import aiosqlite
 import os
+from datetime import datetime, timezone
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "support_bot.db")
 
@@ -13,9 +14,15 @@ async def init_db():
                 first_name TEXT,
                 username TEXT,
                 topic_id INTEGER,
+                last_auto_reply TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Миграция: добавить last_auto_reply если таблица уже существует
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN last_auto_reply TEXT")
+        except Exception:
+            pass  # Колонка уже существует
         await db.commit()
 
 
@@ -56,3 +63,25 @@ async def get_user_by_topic(topic_id: int) -> dict | None:
             if row:
                 return dict(row)
     return None
+
+
+async def should_send_auto_reply(user_id: int) -> bool:
+    """Проверить, нужно ли отправить авто-ответ (не чаще раза в день)."""
+    user = await get_user(user_id)
+    if not user or not user.get("last_auto_reply"):
+        return True
+
+    last = datetime.fromisoformat(user["last_auto_reply"])
+    now = datetime.now(timezone.utc)
+    return (now - last).total_seconds() > 86400  # 24 часа
+
+
+async def update_auto_reply_time(user_id: int):
+    """Обновить время последнего авто-ответа."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_auto_reply = ? WHERE user_id = ?",
+            (now, user_id),
+        )
+        await db.commit()

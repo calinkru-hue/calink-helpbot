@@ -8,8 +8,21 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import BOT_TOKEN, SUPPORT_GROUP_ID, WELCOME_MESSAGE
-from database import init_db, get_user, create_user, get_user_by_topic
+from config import (
+    BOT_TOKEN,
+    SUPPORT_GROUP_ID,
+    WELCOME_MESSAGE,
+    AUTO_REPLY_MESSAGE,
+    AUTO_REPLY_DELAY,
+)
+from database import (
+    init_db,
+    get_user,
+    create_user,
+    get_user_by_topic,
+    should_send_auto_reply,
+    update_auto_reply_time,
+)
 
 # Логирование
 logging.basicConfig(
@@ -28,6 +41,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# Авто-ответ через 5 секунд (job callback)
+# ─────────────────────────────────────────────
+async def send_auto_reply(context: ContextTypes.DEFAULT_TYPE):
+    """Отправить авто-ответ пользователю (вызывается по таймеру)."""
+    user_id = context.job.data
+    try:
+        await context.bot.send_message(chat_id=user_id, text=AUTO_REPLY_MESSAGE)
+        await update_auto_reply_time(user_id)
+        logger.info(f"Авто-ответ отправлен user {user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка авто-ответа для user {user_id}: {e}")
+
+
+# ─────────────────────────────────────────────
 # Сообщение от клиента → группа саппорта
 # ─────────────────────────────────────────────
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -43,8 +70,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Найти или создать топик для этого пользователя
     db_user = await get_user(user_id)
+    is_new_user = db_user is None
 
-    if db_user is None:
+    if is_new_user:
         # Создаём новый топик в группе саппорта
         topic_name = first_name
         if username:
@@ -81,13 +109,29 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text(
             "Не удалось отправить сообщение. Попробуйте позже."
         )
+        return
+
+    # Авто-ответ: через 5 секунд, не чаще раза в день
+    # Проверяем, нет ли уже запланированного авто-ответа для этого пользователя
+    job_name = f"auto_reply_{user_id}"
+    existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+    if not existing_jobs:
+        # Проверяем, нужно ли отправлять (не чаще раза в день)
+        if await should_send_auto_reply(user_id):
+            context.job_queue.run_once(
+                send_auto_reply,
+                when=AUTO_REPLY_DELAY,
+                data=user_id,
+                name=job_name,
+            )
 
 
 # ─────────────────────────────────────────────
 # Сообщение от саппорта → клиенту
+# (только если это Reply на сообщение бота)
 # ─────────────────────────────────────────────
 async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Саппорт пишет в топике → бот пересылает клиенту."""
+    """Саппорт отвечает на сообщение бота в топике → бот пересылает клиенту."""
     message = update.message
     if not message:
         return
@@ -100,12 +144,20 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     if not message.message_thread_id:
         return
 
+    # ✅ Только если это Reply на сообщение бота
+    if not message.reply_to_message:
+        return  # Обычное сообщение в топике — внутреннее обсуждение, не пересылаем
+
+    # Проверяем, что отвечают на сообщение бота (пересланное от клиента)
+    replied_to = message.reply_to_message
+    if not replied_to.from_user or replied_to.from_user.id != context.bot.id:
+        return  # Reply на сообщение другого саппорта — не пересылаем
+
     topic_id = message.message_thread_id
 
     # Найти клиента по topic_id
     db_user = await get_user_by_topic(topic_id)
     if db_user is None:
-        # Топик не связан с пользователем — игнорируем
         return
 
     # Пересылаем ответ клиенту
