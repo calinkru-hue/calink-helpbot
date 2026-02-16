@@ -28,6 +28,8 @@ from database import (
     save_message_mapping,
     get_client_message_id,
     delete_message_mapping,
+    mark_calink_user,
+    save_card_message_id,
 )
 from calink_api import lookup_calink_user, format_user_card
 
@@ -53,6 +55,25 @@ def _get_reply_target(message):
     if replied_to.forum_topic_created:
         return None
     return replied_to
+
+
+async def _send_and_pin_card(context, topic_id: int, card_text: str) -> int | None:
+    """Отправить карточку в топик и запинить. Вернуть message_id."""
+    try:
+        card_msg = await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=card_text,
+            disable_web_page_preview=True,
+        )
+        await context.bot.pin_chat_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_id=card_msg.message_id,
+        )
+        return card_msg.message_id
+    except TelegramError:
+        logger.exception("Ошибка отправки/пина карточки в топик %d", topic_id)
+        return None
 
 
 # ─── /start ──────────────────────────────────
@@ -99,6 +120,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     db_user = await get_user(user_id)
 
     if db_user is None:
+        # ── Новый пользователь: создаём топик + карточку ──
         topic_name = first_name
         if username:
             topic_name += f" @{username}"
@@ -115,24 +137,40 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
             return
 
-        # Карточка пользователя: запрос в Calink API + пин
+        # Карточка пользователя
         calink_user = await lookup_calink_user(user_id)
         card_text = format_user_card(calink_user, username)
-        try:
-            card_msg = await context.bot.send_message(
-                chat_id=SUPPORT_GROUP_ID,
-                message_thread_id=topic_id,
-                text=card_text,
-                disable_web_page_preview=True,
-            )
-            await context.bot.pin_chat_message(
-                chat_id=SUPPORT_GROUP_ID,
-                message_id=card_msg.message_id,
-            )
-        except TelegramError:
-            logger.exception("Ошибка отправки/пина карточки в топик %d", topic_id)
+        card_id = await _send_and_pin_card(context, topic_id, card_text)
+
+        if card_id:
+            if calink_user:
+                await mark_calink_user(user_id, card_id)
+            else:
+                await save_card_message_id(user_id, card_id)
     else:
         topic_id = db_user["topic_id"]
+
+        # ── Существующий не-Calink пользователь: перепроверяем ──
+        if not db_user.get("is_calink_user"):
+            calink_user = await lookup_calink_user(user_id)
+            if calink_user:
+                # Удаляем старую карточку
+                old_card_id = db_user.get("card_message_id")
+                if old_card_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=SUPPORT_GROUP_ID,
+                            message_id=old_card_id,
+                        )
+                    except TelegramError:
+                        logger.warning("Не удалось удалить старую карточку %s", old_card_id)
+
+                # Новая карточка с данными Calink
+                card_text = format_user_card(calink_user, username)
+                card_id = await _send_and_pin_card(context, topic_id, card_text)
+                if card_id:
+                    await mark_calink_user(user_id, card_id)
+                logger.info("User %d найден в Calink, карточка обновлена", user_id)
 
     try:
         sent = await message.copy(

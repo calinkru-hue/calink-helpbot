@@ -19,6 +19,8 @@ async def init_db():
                 first_name TEXT,
                 username TEXT,
                 topic_id INTEGER NOT NULL,
+                is_calink_user INTEGER DEFAULT 0,
+                card_message_id INTEGER,
                 last_auto_reply TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )
@@ -37,11 +39,12 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_messages_client
             ON messages (client_message_id, user_id)
         """)
-        # Миграция: добавить last_auto_reply если таблица уже существует
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN last_auto_reply TEXT")
-        except Exception:
-            pass  # Колонка уже существует
+        # Миграции для существующих таблиц
+        for col in ("last_auto_reply TEXT", "is_calink_user INTEGER DEFAULT 0", "card_message_id INTEGER"):
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            except Exception:
+                pass
         await db.commit()
         logger.info("БД инициализирована: %s", DB_PATH)
 
@@ -53,7 +56,8 @@ async def get_user(user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, first_name, username, topic_id, last_auto_reply "
+            "SELECT user_id, first_name, username, topic_id, "
+            "is_calink_user, card_message_id, last_auto_reply "
             "FROM users WHERE user_id = ?",
             (user_id,),
         ) as cursor:
@@ -77,12 +81,34 @@ async def get_user_by_topic(topic_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, first_name, username, topic_id "
+            "SELECT user_id, first_name, username, topic_id, "
+            "is_calink_user, card_message_id "
             "FROM users WHERE topic_id = ?",
             (topic_id,),
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+
+async def mark_calink_user(user_id: int, card_message_id: int):
+    """Отметить пользователя как найденного в Calink и сохранить ID карточки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET is_calink_user = 1, card_message_id = ? "
+            "WHERE user_id = ?",
+            (card_message_id, user_id),
+        )
+        await db.commit()
+
+
+async def save_card_message_id(user_id: int, card_message_id: int):
+    """Сохранить ID сообщения-карточки (для не-Calink пользователей)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET card_message_id = ? WHERE user_id = ?",
+            (card_message_id, user_id),
+        )
+        await db.commit()
 
 
 async def should_send_auto_reply(user_id: int) -> bool:
