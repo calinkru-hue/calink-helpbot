@@ -1,6 +1,9 @@
 import aiosqlite
 import os
+import logging
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 # Railway: volume примонтирован в /data/, локально — рядом с ботом
 DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
@@ -8,17 +11,31 @@ DB_PATH = os.path.join(DATA_DIR, "support_bot.db")
 
 
 async def init_db():
-    """Создать таблицу users, если не существует."""
+    """Создать таблицы, если не существуют."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 first_name TEXT,
                 username TEXT,
-                topic_id INTEGER,
+                topic_id INTEGER NOT NULL,
                 last_auto_reply TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT (datetime('now'))
             )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                group_message_id INTEGER NOT NULL,
+                client_message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                topic_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (group_message_id, topic_id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_client
+            ON messages (client_message_id, user_id)
         """)
         # Миграция: добавить last_auto_reply если таблица уже существует
         try:
@@ -26,29 +43,30 @@ async def init_db():
         except Exception:
             pass  # Колонка уже существует
         await db.commit()
+        logger.info("БД инициализирована: %s", DB_PATH)
 
+
+# ─── Users ───────────────────────────────────
 
 async def get_user(user_id: int) -> dict | None:
     """Получить пользователя по user_id."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            "SELECT user_id, first_name, username, topic_id, last_auto_reply "
+            "FROM users WHERE user_id = ?",
+            (user_id,),
         ) as cursor:
             row = await cursor.fetchone()
-            if row:
-                return dict(row)
-    return None
+            return dict(row) if row else None
 
 
 async def create_user(user_id: int, first_name: str, username: str, topic_id: int):
     """Создать нового пользователя с привязкой к топику."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """
-            INSERT INTO users (user_id, first_name, username, topic_id)
-            VALUES (?, ?, ?, ?)
-            """,
+            "INSERT INTO users (user_id, first_name, username, topic_id) "
+            "VALUES (?, ?, ?, ?)",
             (user_id, first_name, username, topic_id),
         )
         await db.commit()
@@ -59,12 +77,12 @@ async def get_user_by_topic(topic_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE topic_id = ?", (topic_id,)
+            "SELECT user_id, first_name, username, topic_id "
+            "FROM users WHERE topic_id = ?",
+            (topic_id,),
         ) as cursor:
             row = await cursor.fetchone()
-            if row:
-                return dict(row)
-    return None
+            return dict(row) if row else None
 
 
 async def should_send_auto_reply(user_id: int) -> bool:
@@ -72,10 +90,9 @@ async def should_send_auto_reply(user_id: int) -> bool:
     user = await get_user(user_id)
     if not user or not user.get("last_auto_reply"):
         return True
-
     last = datetime.fromisoformat(user["last_auto_reply"])
     now = datetime.now(timezone.utc)
-    return (now - last).total_seconds() > 86400  # 24 часа
+    return (now - last).total_seconds() > 86400
 
 
 async def update_auto_reply_time(user_id: int):
@@ -85,5 +102,46 @@ async def update_auto_reply_time(user_id: int):
         await db.execute(
             "UPDATE users SET last_auto_reply = ? WHERE user_id = ?",
             (now, user_id),
+        )
+        await db.commit()
+
+
+# ─── Messages (маппинг group ↔ client) ──────
+
+async def save_message_mapping(
+    group_message_id: int,
+    client_message_id: int,
+    user_id: int,
+    topic_id: int,
+):
+    """Сохранить связь group_message_id ↔ client_message_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO messages "
+            "(group_message_id, client_message_id, user_id, topic_id) "
+            "VALUES (?, ?, ?, ?)",
+            (group_message_id, client_message_id, user_id, topic_id),
+        )
+        await db.commit()
+
+
+async def get_client_message_id(group_message_id: int, topic_id: int) -> int | None:
+    """Найти client_message_id по group_message_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT client_message_id FROM messages "
+            "WHERE group_message_id = ? AND topic_id = ?",
+            (group_message_id, topic_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def delete_message_mapping(group_message_id: int, topic_id: int):
+    """Удалить запись маппинга."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM messages WHERE group_message_id = ? AND topic_id = ?",
+            (group_message_id, topic_id),
         )
         await db.commit()
