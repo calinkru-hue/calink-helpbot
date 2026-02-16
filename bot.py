@@ -28,6 +28,7 @@ from database import (
     get_client_message_id,
     delete_message_mapping,
 )
+from calink_api import lookup_calink_user, format_user_card
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -104,6 +105,22 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Ошибка создания топика для user %d", user_id)
             await message.reply_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
             return
+
+        # Карточка пользователя: запрос в Calink API + пин
+        calink_user = await lookup_calink_user(user_id)
+        card_text = format_user_card(calink_user, username)
+        try:
+            card_msg = await context.bot.send_message(
+                chat_id=SUPPORT_GROUP_ID,
+                message_thread_id=topic_id,
+                text=card_text,
+            )
+            await context.bot.pin_chat_message(
+                chat_id=SUPPORT_GROUP_ID,
+                message_id=card_msg.message_id,
+            )
+        except TelegramError:
+            logger.exception("Ошибка отправки/пина карточки в топик %d", topic_id)
     else:
         topic_id = db_user["topic_id"]
 

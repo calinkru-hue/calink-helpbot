@@ -18,3 +18,9 @@ AUTO_REPLY_MESSAGE = (
 
 # Задержка перед авто-ответом (секунды)
 AUTO_REPLY_DELAY = 5
+
+# Calink API
+CALINK_API_URL = "https://calink.ru/api/hooks/support/user/info"
+CALINK_API_SECRET = os.getenv(
+    "CALINK_API_SECRET", "HE110_k3y_f0r_SUPp0rt_h00k"
+)
