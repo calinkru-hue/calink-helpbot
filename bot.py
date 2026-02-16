@@ -1,5 +1,5 @@
 import logging
-from telegram import Update
+from telegram import ReactionTypeEmoji, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -169,6 +169,8 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     # Пересылаем ответ клиенту
     try:
         await message.copy(chat_id=db_user["user_id"])
+        # Ставим ✅ на сообщение саппорта как подтверждение
+        await message.set_reaction(reaction=[ReactionTypeEmoji("✅")])
     except Exception as e:
         logger.error(f"Ошибка пересылки клиенту {db_user['user_id']}: {e}")
 
