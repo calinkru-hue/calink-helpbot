@@ -166,7 +166,7 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
             user_id=db_user["user_id"],
             topic_id=topic_id,
         )
-        await message.set_reaction(reaction=[ReactionTypeEmoji("✅")])
+        await message.set_reaction(reaction=[ReactionTypeEmoji("👍")])
     except TelegramError:
         logger.exception("Ошибка пересылки клиенту %d", db_user["user_id"])
 
@@ -206,7 +206,7 @@ async def handle_edited_support_message(update: Update, context: ContextTypes.DE
                 caption=message.caption,
                 caption_entities=message.caption_entities,
             )
-        await message.set_reaction(reaction=[ReactionTypeEmoji("✏️")])
+        await message.set_reaction(reaction=[ReactionTypeEmoji("✍")])
         logger.info("Сообщение %d отредактировано у клиента %d", message.message_id, db_user["user_id"])
     except TelegramError:
         logger.exception("Ошибка редактирования у клиента %d", db_user["user_id"])
@@ -320,10 +320,10 @@ def main():
         )
     )
 
-    # Группа: reply-ответ саппорта → клиенту
+    # Группа: reply-ответ саппорта → клиенту (только новые, не edited)
     app.add_handler(
         MessageHandler(
-            filters.Chat(SUPPORT_GROUP_ID) & ~filters.COMMAND & filters.IS_TOPIC_MESSAGE,
+            filters.Chat(SUPPORT_GROUP_ID) & ~filters.COMMAND & filters.IS_TOPIC_MESSAGE & filters.UpdateType.MESSAGE,
             handle_support_message,
         )
     )
