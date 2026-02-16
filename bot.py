@@ -13,7 +13,8 @@ from telegram.ext import (
 from config import (
     BOT_TOKEN,
     SUPPORT_GROUP_ID,
-    WELCOME_MESSAGE,
+    WELCOME_MESSAGE_CALINK,
+    WELCOME_MESSAGE_DEFAULT,
     AUTO_REPLY_MESSAGE,
     AUTO_REPLY_DELAY,
 )
@@ -57,8 +58,16 @@ def _get_reply_target(message):
 # ─── /start ──────────────────────────────────
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие клиента."""
-    await update.message.reply_text(WELCOME_MESSAGE)
+    """Приветствие клиента — персонализированное для пользователей Calink."""
+    user_id = update.message.from_user.id
+    calink_user = await lookup_calink_user(user_id)
+
+    if calink_user and calink_user.get("grub"):
+        text = WELCOME_MESSAGE_CALINK.format(grub=calink_user["grub"])
+    else:
+        text = WELCOME_MESSAGE_DEFAULT
+
+    await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 # ─── Авто-ответ (job callback) ───────────────
@@ -67,7 +76,7 @@ async def send_auto_reply(context: ContextTypes.DEFAULT_TYPE):
     """Отправить авто-ответ пользователю через N секунд."""
     user_id = context.job.data
     try:
-        await context.bot.send_message(chat_id=user_id, text=AUTO_REPLY_MESSAGE)
+        await context.bot.send_message(chat_id=user_id, text=AUTO_REPLY_MESSAGE, disable_web_page_preview=True)
         await update_auto_reply_time(user_id)
         logger.info("Авто-ответ отправлен user %d", user_id)
     except TelegramError:
