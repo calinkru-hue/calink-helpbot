@@ -114,6 +114,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=SUPPORT_GROUP_ID,
                 message_thread_id=topic_id,
                 text=card_text,
+                disable_web_page_preview=True,
             )
             await context.bot.pin_chat_message(
                 chat_id=SUPPORT_GROUP_ID,
