@@ -1,4 +1,5 @@
 import logging
+import re
 import traceback
 
 from telegram import ReactionTypeEmoji, Update
@@ -18,6 +19,7 @@ from config import (
     WELCOME_MESSAGE_DEFAULT,
     AUTO_REPLY_MESSAGE,
     AUTO_REPLY_DELAY,
+    RESET_KEYWORD,
 )
 from database import (
     init_db,
@@ -32,6 +34,7 @@ from database import (
     mark_calink_user,
     save_card_message_id,
     log_event,
+    delete_user_by_topic,
 )
 from calink_api import lookup_calink_user, format_user_card
 from admin_server import start_admin_server
@@ -463,6 +466,54 @@ async def handle_del_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning("Частичное удаление msg %d: %s", target_msg_id, "; ".join(errors))
 
 
+# ─── Hard-reset юзера по кодовому слову ──────
+
+async def handle_reset_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кодовое слово в топике (по умолчанию !user_del!) → полностью стереть
+    юзера из БД и закрыть топик. Инструмент для QA: позволяет пройти онбординг
+    «с чистого листа» — при следующем сообщении бот увидит юзера впервые.
+
+    Что делает:
+      1. удаляет само сообщение-триггер (чтобы не мозолило глаза в топике)
+      2. каскадом стирает users / messages / event_log по topic_id
+      3. снимает pending-джобу авто-ответа (иначе она выстрелит уже после
+         удаления юзера и запишет осиротевший bot_message)
+      4. закрывает форум-топик — он уезжает в архив
+
+    В event_log ничего не пишет: reset не должен попадать в аналитику.
+    """
+    message = update.message
+    if not message or not message.message_thread_id:
+        return
+
+    topic_id = message.message_thread_id
+
+    # Сначала убираем триггер — даже если дальше что-то упадёт.
+    try:
+        await message.delete()
+    except TelegramError:
+        logger.warning("Не удалось удалить сообщение-триггер reset в топике %d", topic_id)
+
+    user_id = await delete_user_by_topic(topic_id)
+
+    if user_id is None:
+        logger.info("Reset в топике %d: юзер не найден в БД, чистить нечего", topic_id)
+    else:
+        # Снимаем запланированный авто-ответ для удалённого юзера.
+        for job in context.job_queue.get_jobs_by_name(f"auto_reply_{user_id}"):
+            job.schedule_removal()
+
+    try:
+        await context.bot.close_forum_topic(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+        )
+    except TelegramError:
+        logger.warning("Не удалось закрыть топик %d", topic_id)
+
+    logger.info("✅ Reset выполнен: топик=%d, user_id=%s", topic_id, user_id)
+
+
 # ─── Внутренняя переписка саппортов (только лог) ─
 
 async def handle_support_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,6 +527,13 @@ async def handle_support_internal(update: Update, context: ContextTypes.DEFAULT_
     if not message or _is_from_bot(message, context):
         return
     if not message.message_thread_id:
+        return
+
+    # Пропускаем кодовое слово reset: оно живёт в группе 0 (handle_reset_keyword),
+    # которая каскадом чистит event_log по topic_id. Логирование здесь, в группе 1,
+    # выполнилось бы ПОСЛЕ каскада и оставило осиротевшую строку на уже стёртый
+    # топик. Точно этот баг ловили в zorion-helpbot.
+    if message.text and message.text == RESET_KEYWORD:
         return
 
     # Reply на сообщение бота → это ответ клиенту, уже залогирован в группе 0.
@@ -587,6 +645,18 @@ def main():
             "del",
             handle_del_command,
             filters=filters.Chat(SUPPORT_GROUP_ID) & filters.IS_TOPIC_MESSAGE,
+        )
+    )
+
+    # Группа: кодовое слово hard-reset. Должен быть ДО handle_support_message —
+    # внутри группы 0 обрабатывает первый совпавший хендлер.
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(SUPPORT_GROUP_ID)
+            & filters.IS_TOPIC_MESSAGE
+            & filters.UpdateType.MESSAGE
+            & filters.Regex(rf"^{re.escape(RESET_KEYWORD)}$"),
+            handle_reset_keyword,
         )
     )
 
