@@ -1,4 +1,5 @@
 import aiosqlite
+import json
 import os
 import logging
 from datetime import datetime, timezone
@@ -38,6 +39,37 @@ async def init_db():
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_client
             ON messages (client_message_id, user_id)
+        """)
+        # Плоский audit-trail всей переписки. Схема намеренно 1-в-1 с
+        # zorion-helpbot, чтобы один и тот же аналитический SQL работал на
+        # обоих ботах. Колонка email_message_id здесь всегда NULL (в Calink
+        # нет email-канала) — оставлена ради совместимости запросов.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS event_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id        INTEGER,
+                channel         TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                direction       TEXT,
+                actor_type      TEXT,
+                actor_id        TEXT,
+                actor_name      TEXT,
+                text            TEXT,
+                media_type      TEXT,
+                media_file_id   TEXT,
+                tg_message_id   INTEGER,
+                email_message_id TEXT,
+                extra_json      TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_event_log_topic
+            ON event_log (topic_id, created_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_event_log_type
+            ON event_log (event_type, created_at)
         """)
         # Миграции для существующих таблиц
         for col in ("last_auto_reply TEXT", "is_calink_user INTEGER DEFAULT 0", "card_message_id INTEGER"):
@@ -171,3 +203,40 @@ async def delete_message_mapping(group_message_id: int, topic_id: int):
             (group_message_id, topic_id),
         )
         await db.commit()
+
+
+# ─── Event log (полная история переписки) ────
+
+async def log_event(
+    *,
+    event_type: str,
+    channel: str = "telegram",
+    topic_id: int | None = None,
+    direction: str | None = None,
+    actor_type: str | None = None,
+    actor_id: str | int | None = None,
+    actor_name: str | None = None,
+    text: str | None = None,
+    media_type: str | None = None,
+    media_file_id: str | None = None,
+    tg_message_id: int | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Добавить одну запись в event_log. Устойчива к ошибкам — никогда не
+    поднимает исключение: падение аудит-лога не должно ломать основной флоу."""
+    try:
+        actor_id_str = str(actor_id) if actor_id is not None else None
+        extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO event_log (topic_id, channel, event_type, direction, "
+                "actor_type, actor_id, actor_name, text, media_type, media_file_id, "
+                "tg_message_id, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (topic_id, channel, event_type, direction, actor_type, actor_id_str,
+                 actor_name, text, media_type, media_file_id, tg_message_id,
+                 extra_json),
+            )
+            await db.commit()
+    except Exception:
+        logger.exception("log_event failed (type=%s topic=%s)", event_type, topic_id)

@@ -1,4 +1,5 @@
 import logging
+import traceback
 
 from telegram import ReactionTypeEmoji, Update
 from telegram.error import TelegramError
@@ -30,8 +31,10 @@ from database import (
     delete_message_mapping,
     mark_calink_user,
     save_card_message_id,
+    log_event,
 )
 from calink_api import lookup_calink_user, format_user_card
+from admin_server import start_admin_server
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -55,6 +58,56 @@ def _get_reply_target(message):
     if replied_to.forum_topic_created:
         return None
     return replied_to
+
+
+# ─── Хелперы event_log ───────────────────────
+
+def _describe_media(message) -> tuple[str | None, str | None, str]:
+    """Вернуть (media_type, file_id, placeholder) для сообщения TG.
+    Placeholder пустой, если медиа нет. Сами файлы не скачиваем — по file_id
+    оригинал всегда можно достать через Bot API getFile."""
+    if message.photo:
+        return ("photo", message.photo[-1].file_id, "[photo]")
+    if message.video:
+        dur = getattr(message.video, "duration", None)
+        return ("video", message.video.file_id, f"[video {dur}s]" if dur else "[video]")
+    if message.voice:
+        dur = getattr(message.voice, "duration", None)
+        return ("voice", message.voice.file_id, f"[voice {dur}s]" if dur else "[voice]")
+    if message.audio:
+        return ("audio", message.audio.file_id, "[audio]")
+    if message.document:
+        size = (message.document.file_size or 0) / 1024 / 1024
+        name = message.document.file_name or "file"
+        return ("document", message.document.file_id, f"[document {name} {size:.1f}MB]")
+    if message.sticker:
+        em = message.sticker.emoji or ""
+        return ("sticker", message.sticker.file_id, f"[sticker {em}]".strip())
+    if message.animation:
+        return ("animation", message.animation.file_id, "[animation]")
+    if message.video_note:
+        return ("video_note", message.video_note.file_id, "[video_note]")
+    return (None, None, "")
+
+
+def _message_to_log_payload(message) -> tuple[str, str | None, str | None]:
+    """Превратить сообщение TG в (text, media_type, file_id) для event_log.
+    Если есть и медиа, и caption — склеивает placeholder с подписью."""
+    media_type, file_id, placeholder = _describe_media(message)
+    if message.text:
+        return (message.text, media_type, file_id)
+    if message.caption:
+        if placeholder:
+            return (f"{placeholder}: {message.caption}", media_type, file_id)
+        return (message.caption, None, None)
+    return (placeholder, media_type, file_id)
+
+
+def _actor_name(first_name: str | None, username: str | None) -> str:
+    name = (first_name or "").strip()
+    if username:
+        name = f"{name} @{username}".strip() if name else f"@{username}"
+    return name
 
 
 async def _send_and_pin_card(context, topic_id: int, card_text: str) -> int | None:
@@ -90,6 +143,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, disable_web_page_preview=True)
 
+    # Топика у нового юзера ещё может не быть — тогда topic_id останется NULL.
+    db_user = await get_user(user_id)
+    await log_event(
+        event_type="bot_message",
+        topic_id=db_user["topic_id"] if db_user else None,
+        direction="out",
+        actor_type="bot",
+        actor_id="bot",
+        text=text,
+        extra={"trigger": "/start", "to_user_id": user_id},
+    )
+
 
 # ─── Авто-ответ (job callback) ───────────────
 
@@ -100,6 +165,16 @@ async def send_auto_reply(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text=AUTO_REPLY_MESSAGE, disable_web_page_preview=True)
         await update_auto_reply_time(user_id)
         logger.info("Авто-ответ отправлен user %d", user_id)
+        db_user = await get_user(user_id)
+        await log_event(
+            event_type="bot_message",
+            topic_id=db_user["topic_id"] if db_user else None,
+            direction="out",
+            actor_type="bot",
+            actor_id="bot",
+            text=AUTO_REPLY_MESSAGE,
+            extra={"trigger": "auto_reply", "to_user_id": user_id},
+        )
     except TelegramError:
         logger.exception("Ошибка авто-ответа для user %d", user_id)
 
@@ -132,6 +207,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             topic_id = forum_topic.message_thread_id
             await create_user(user_id, first_name, username, topic_id)
             logger.info("Создан топик '%s' (id=%d) для user %d", topic_name, topic_id, user_id)
+            await log_event(
+                event_type="topic_created",
+                topic_id=topic_id,
+                direction="system",
+                actor_type="system",
+                actor_id=user_id,
+                actor_name=_actor_name(first_name, username),
+                text=topic_name,
+            )
         except TelegramError:
             logger.exception("Ошибка создания топика для user %d", user_id)
             await message.reply_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
@@ -184,6 +268,19 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_id=user_id,
             topic_id=topic_id,
         )
+        text_for_log, media_type, file_id = _message_to_log_payload(message)
+        await log_event(
+            event_type="client_message",
+            topic_id=topic_id,
+            direction="in",
+            actor_type="client",
+            actor_id=user_id,
+            actor_name=_actor_name(first_name, username),
+            text=text_for_log,
+            media_type=media_type,
+            media_file_id=file_id,
+            tg_message_id=message.message_id,
+        )
     except TelegramError:
         logger.exception("Ошибка пересылки в топик для user %d", user_id)
         await message.reply_text("Не удалось отправить сообщение. Попробуйте позже.")
@@ -230,6 +327,24 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
             client_message_id=sent.message_id,
             user_id=db_user["user_id"],
             topic_id=topic_id,
+        )
+        text_for_log, media_type, file_id = _message_to_log_payload(message)
+        sender = message.from_user
+        await log_event(
+            event_type="support_reply",
+            topic_id=topic_id,
+            direction="out",
+            actor_type="support",
+            actor_id=sender.id if sender else None,
+            actor_name=_actor_name(
+                sender.first_name if sender else "",
+                sender.username if sender else "",
+            ),
+            text=text_for_log,
+            media_type=media_type,
+            media_file_id=file_id,
+            tg_message_id=message.message_id,
+            extra={"to_user_id": db_user["user_id"]},
         )
         await message.set_reaction(reaction=[ReactionTypeEmoji("👍")])
     except TelegramError:
@@ -348,11 +463,95 @@ async def handle_del_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning("Частичное удаление msg %d: %s", target_msg_id, "; ".join(errors))
 
 
+# ─── Внутренняя переписка саппортов (только лог) ─
+
+async def handle_support_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log-only хендлер: любое сообщение в топике, которое НЕ является reply на
+    сообщение бота (те обрабатывает handle_support_message и логирует как
+    support_reply). Никуда не пересылает — только пишет в event_log.
+
+    Живёт в handler-группе 1, поэтому срабатывает ПОСЛЕ группы 0 для того же
+    апдейта и не мешает основному роутингу."""
+    message = update.message
+    if not message or _is_from_bot(message, context):
+        return
+    if not message.message_thread_id:
+        return
+
+    # Reply на сообщение бота → это ответ клиенту, уже залогирован в группе 0.
+    replied_to = _get_reply_target(message)
+    if replied_to and replied_to.from_user and replied_to.from_user.id == context.bot.id:
+        return
+
+    text_for_log, media_type, file_id = _message_to_log_payload(message)
+    sender = message.from_user
+    await log_event(
+        event_type="support_internal",
+        topic_id=message.message_thread_id,
+        direction="internal",
+        actor_type="support",
+        actor_id=sender.id if sender else None,
+        actor_name=_actor_name(
+            sender.first_name if sender else "",
+            sender.username if sender else "",
+        ),
+        text=text_for_log,
+        media_type=media_type,
+        media_file_id=file_id,
+        tg_message_id=message.message_id,
+    )
+
+
+# ─── Глобальный обработчик ошибок ────────────
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит любое упавшее исключение в хендлерах и пишет его в event_log."""
+    logger.exception("Необработанная ошибка в хендлере", exc_info=context.error)
+
+    topic_id = None
+    if isinstance(update, Update) and update.effective_message:
+        topic_id = update.effective_message.message_thread_id
+
+    await log_event(
+        event_type="error",
+        topic_id=topic_id,
+        direction="system",
+        actor_type="system",
+        text=str(context.error),
+        extra={
+            "where": "global_error_handler",
+            "traceback": "".join(
+                traceback.format_exception(
+                    type(context.error), context.error, context.error.__traceback__
+                )
+            )[-4000:] if context.error else None,
+        },
+    )
+
+
 # ─── Запуск ──────────────────────────────────
 
+_admin_runner = None
+
+
 async def post_init(application: Application):
-    """Инициализация БД при старте."""
+    """Инициализация БД + подъём admin-сервера при старте."""
+    global _admin_runner
     await init_db()
+    try:
+        _admin_runner = await start_admin_server()
+    except Exception:
+        logger.exception("Не удалось поднять admin-сервер — бот продолжает работу")
+
+
+async def post_shutdown(application: Application):
+    """Корректно остановить admin-сервер."""
+    global _admin_runner
+    if _admin_runner is not None:
+        try:
+            await _admin_runner.cleanup()
+        except Exception:
+            logger.exception("Ошибка остановки admin-сервера")
 
 
 def main():
@@ -361,7 +560,13 @@ def main():
     if not SUPPORT_GROUP_ID:
         raise ValueError("SUPPORT_GROUP_ID не задан! Проверьте файл .env")
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Личка: /start
     app.add_handler(
@@ -400,6 +605,19 @@ def main():
             handle_edited_support_message,
         )
     )
+
+    # Группа 1: log-only логгер внутренней переписки саппортов.
+    # Отдельная handler-группа, чтобы срабатывать после основного роутинга
+    # (группа 0) для того же апдейта, а не вместо него.
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(SUPPORT_GROUP_ID) & ~filters.COMMAND & filters.IS_TOPIC_MESSAGE & filters.UpdateType.MESSAGE,
+            handle_support_internal,
+        ),
+        group=1,
+    )
+
+    app.add_error_handler(global_error_handler)
 
     logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

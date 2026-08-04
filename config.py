@@ -26,3 +26,14 @@ CALINK_API_URL = "https://calink.ru/api/hooks/support/user/info"
 CALINK_API_SECRET = os.getenv(
     "CALINK_API_SECRET", "HE110_k3y_f0r_SUPp0rt_h00k"
 )
+
+# ─── Admin HTTP server (снапшот БД) ──────────
+
+# Railway подставляет PORT сам; локально — 8080.
+ADMIN_PORT = int(os.getenv("PORT") or os.getenv("ADMIN_PORT") or "8080")
+
+# Bearer-токены для GET /admin/db через запятую, один токен на человека.
+# Пусто → эндпоинт отключён (отдаёт 503). Отзыв = удалить токен из env.
+ADMIN_DB_TOKENS = frozenset(
+    t.strip() for t in os.getenv("ADMIN_DB_TOKENS", "").split(",") if t.strip()
+)
