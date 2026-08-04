@@ -205,6 +205,34 @@ async def delete_message_mapping(group_message_id: int, topic_id: int):
         await db.commit()
 
 
+# ─── Hard-reset юзера (dev/QA) ───────────────
+
+async def delete_user_by_topic(topic_id: int) -> int | None:
+    """Полностью стереть юзера, привязанного к топику, из всех 3 таблиц одной
+    транзакцией. Возвращает user_id (для отмены pending-джобов и логов) либо
+    None, если топик не найден.
+
+    Намеренно НЕ пишет ничего в event_log: reset — тестовый инструмент, его
+    служебная активность не должна попадать в аналитику. Следы остаются только
+    в логах Railway.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM users WHERE topic_id = ?", (topic_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            user_id = row[0] if row else None
+
+        if user_id is not None:
+            await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM messages WHERE topic_id = ?", (topic_id,))
+        await db.execute("DELETE FROM event_log WHERE topic_id = ?", (topic_id,))
+        await db.commit()
+
+    return user_id
+
+
 # ─── Event log (полная история переписки) ────
 
 async def log_event(
