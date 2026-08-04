@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import traceback
@@ -6,6 +7,7 @@ from telegram import ReactionTypeEmoji, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -20,6 +22,12 @@ from config import (
     AUTO_REPLY_MESSAGE,
     AUTO_REPLY_DELAY,
     RESET_KEYWORD,
+    FEEDBACK_ENABLED,
+    RATING_PROMPT,
+    FEEDBACK_THANK_YOU,
+    FEEDBACK_NOT_RESOLVED_ACK,
+    TOPIC_NOTICE_RESOLVED,
+    TOPIC_NOTICE_NOT_RESOLVED,
 )
 from database import (
     init_db,
@@ -35,9 +43,20 @@ from database import (
     save_card_message_id,
     log_event,
     delete_user_by_topic,
+    mark_support_reply,
+    mark_user_message,
+    get_unanswered_feedback,
+    mark_feedback_yes_clicked,
+    mark_feedback_no_resolved,
+    update_feedback_rating,
 )
 from calink_api import lookup_calink_user, format_user_card
 from admin_server import start_admin_server
+from feedback import (
+    feedback_sweeper,
+    build_rating_keyboard,
+    emoji_for,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -284,6 +303,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             media_file_id=file_id,
             tg_message_id=message.message_id,
         )
+        # Последнее слово за клиентом → sweeper не будет просить оценку,
+        # пока саппорт не ответит.
+        await mark_user_message(user_id)
     except TelegramError:
         logger.exception("Ошибка пересылки в топик для user %d", user_id)
         await message.reply_text("Не удалось отправить сообщение. Попробуйте позже.")
@@ -349,6 +371,9 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
             tg_message_id=message.message_id,
             extra={"to_user_id": db_user["user_id"]},
         )
+        # Перезапускаем таймер фидбека: sweeper спросит оценку через
+        # FEEDBACK_DELAY_HOURS после этого момента.
+        await mark_support_reply(db_user["user_id"])
         await message.set_reaction(reaction=[ReactionTypeEmoji("👍")])
     except TelegramError:
         logger.exception("Ошибка пересылки клиенту %d", db_user["user_id"])
@@ -464,6 +489,169 @@ async def handle_del_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info("Удалено сообщение %d у клиента %d", target_msg_id, db_user["user_id"])
     else:
         logger.warning("Частичное удаление msg %d: %s", target_msg_id, "; ".join(errors))
+
+
+# ─── Фидбек: обработка кнопок ────────────────
+
+async def _log_bot_dm(user_id: int, topic_id: int | None, text: str) -> None:
+    """Записать исходящее сообщение бота клиенту как bot_message."""
+    await log_event(
+        event_type="bot_message",
+        topic_id=topic_id,
+        direction="out",
+        actor_type="bot",
+        actor_id="bot",
+        text=text,
+        extra={"to_user_id": user_id},
+    )
+
+
+async def handle_resolve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: клиент нажал Да или Нет на «Ваш вопрос решён?»."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("resolve:"):
+        return
+    await query.answer()
+
+    answer = query.data.split(":", 1)[1]
+    if answer not in ("yes", "no"):
+        return
+
+    user_id = query.from_user.id
+    fb = await get_unanswered_feedback(user_id)
+
+    if answer == "yes":
+        if fb is not None:
+            posted = await mark_feedback_yes_clicked(fb["id"])
+            if posted:
+                await log_event(
+                    event_type="yes_clicked",
+                    topic_id=fb["topic_id"],
+                    direction="in",
+                    actor_type="client",
+                    actor_id=user_id,
+                    actor_name=_actor_name(
+                        query.from_user.first_name, query.from_user.username,
+                    ),
+                    extra={"feedback_id": fb["id"]},
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=SUPPORT_GROUP_ID,
+                        message_thread_id=fb["topic_id"],
+                        text=TOPIC_NOTICE_RESOLVED,
+                    )
+                except TelegramError:
+                    logger.exception(
+                        "Не удалось написать в топик %d о решении", fb["topic_id"]
+                    )
+        # Показываем шаг 2 даже если строки нет (например, после reset) —
+        # для клиента флоу остаётся связным.
+        try:
+            await query.edit_message_text(
+                RATING_PROMPT,
+                reply_markup=build_rating_keyboard(),
+            )
+            await _log_bot_dm(user_id, fb["topic_id"] if fb else None, RATING_PROMPT)
+        except TelegramError:
+            logger.exception("Не удалось показать клавиатуру оценок")
+        return
+
+    # answer == "no"
+    if fb is None:
+        try:
+            await query.edit_message_text(FEEDBACK_NOT_RESOLVED_ACK)
+        except TelegramError:
+            pass
+        return
+
+    if not await mark_feedback_no_resolved(fb["id"]):
+        # Идемпотентность: клиент уже отвечал.
+        try:
+            await query.edit_message_text(FEEDBACK_NOT_RESOLVED_ACK)
+        except TelegramError:
+            pass
+        return
+
+    await log_event(
+        event_type="no_clicked",
+        topic_id=fb["topic_id"],
+        direction="in",
+        actor_type="client",
+        actor_id=user_id,
+        actor_name=_actor_name(
+            query.from_user.first_name, query.from_user.username,
+        ),
+        extra={"feedback_id": fb["id"]},
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=fb["topic_id"],
+            text=TOPIC_NOTICE_NOT_RESOLVED,
+        )
+    except TelegramError:
+        logger.exception("Не удалось написать в топик %d о нерешённом", fb["topic_id"])
+
+    try:
+        await query.edit_message_text(FEEDBACK_NOT_RESOLVED_ACK)
+        await _log_bot_dm(user_id, fb["topic_id"], FEEDBACK_NOT_RESOLVED_ACK)
+    except TelegramError:
+        pass
+
+
+async def handle_feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: клиент нажал одну из 5 эмодзи-оценок."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("rate:"):
+        return
+    await query.answer()
+
+    try:
+        rating = int(query.data.split(":", 1)[1])
+    except ValueError:
+        return
+    if rating < 1 or rating > 5:
+        return
+
+    user_id = query.from_user.id
+    fb = await get_unanswered_feedback(user_id)
+
+    # Клавиатуру гасим и благодарим всегда — даже если строку не нашли.
+    if fb is None or not await update_feedback_rating(fb["id"], rating):
+        try:
+            await query.edit_message_text(FEEDBACK_THANK_YOU)
+        except TelegramError:
+            pass
+        return
+
+    await log_event(
+        event_type="rated",
+        topic_id=fb["topic_id"],
+        direction="in",
+        actor_type="client",
+        actor_id=user_id,
+        actor_name=_actor_name(
+            query.from_user.first_name, query.from_user.username,
+        ),
+        extra={"feedback_id": fb["id"], "rating": rating},
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=fb["topic_id"],
+            text=f"⭐️ Оценка {emoji_for(rating)} ({rating}/5)",
+        )
+    except TelegramError:
+        logger.exception("Не удалось написать оценку в топик %d", fb["topic_id"])
+
+    try:
+        await query.edit_message_text(FEEDBACK_THANK_YOU)
+        await _log_bot_dm(user_id, fb["topic_id"], FEEDBACK_THANK_YOU)
+    except TelegramError:
+        pass
 
 
 # ─── Hard-reset юзера по кодовому слову ──────
@@ -590,21 +778,38 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 # ─── Запуск ──────────────────────────────────
 
 _admin_runner = None
+_feedback_task = None
 
 
 async def post_init(application: Application):
-    """Инициализация БД + подъём admin-сервера при старте."""
-    global _admin_runner
+    """Инициализация БД + подъём admin-сервера и feedback-sweeper'а."""
+    global _admin_runner, _feedback_task
     await init_db()
     try:
         _admin_runner = await start_admin_server()
     except Exception:
         logger.exception("Не удалось поднять admin-сервер — бот продолжает работу")
 
+    if FEEDBACK_ENABLED:
+        # Ссылку на таск держим в модульной переменной: иначе сборщик мусора
+        # может прибить его на полуслове.
+        _feedback_task = asyncio.create_task(feedback_sweeper(application))
+    else:
+        logger.info("Feedback sweeper выключен (FEEDBACK_ENABLED=false)")
+
 
 async def post_shutdown(application: Application):
-    """Корректно остановить admin-сервер."""
-    global _admin_runner
+    """Корректно остановить sweeper и admin-сервер."""
+    global _admin_runner, _feedback_task
+    if _feedback_task and not _feedback_task.done():
+        _feedback_task.cancel()
+        try:
+            await _feedback_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Ошибка остановки feedback sweeper")
+
     if _admin_runner is not None:
         try:
             await _admin_runner.cleanup()
@@ -685,6 +890,14 @@ def main():
             handle_support_internal,
         ),
         group=1,
+    )
+
+    # Личка: кнопки фидбека
+    app.add_handler(
+        CallbackQueryHandler(handle_resolve_callback, pattern=r"^resolve:(yes|no)$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(handle_feedback_rating, pattern=r"^rate:[1-5]$")
     )
 
     app.add_error_handler(global_error_handler)

@@ -21,6 +21,36 @@ AUTO_REPLY_MESSAGE = "ok, скоро ответим!"
 # Задержка перед авто-ответом (секунды)
 AUTO_REPLY_DELAY = 5
 
+# ─── Фидбек: «вопрос решён?» → оценка ────────
+
+FEEDBACK_ENABLED = (os.getenv("FEEDBACK_ENABLED", "true").lower() != "false")
+
+# Через сколько часов после последнего ответа саппорта спрашивать оценку.
+# На dev ставь 0, чтобы не ждать.
+FEEDBACK_DELAY_HOURS = float(os.getenv("FEEDBACK_DELAY_HOURS") or "2")
+
+# Как часто тикает фоновый sweeper (минуты).
+FEEDBACK_SWEEP_INTERVAL_MIN = int(os.getenv("FEEDBACK_SWEEP_INTERVAL_MIN") or "5")
+
+# Тексты клиенту (по-русски — аудитория Calink русскоязычная)
+RESOLUTION_PROMPT = (
+    "Ваш вопрос решён?"
+)
+
+RATING_PROMPT = "Спасибо! Как оцените нашу помощь?"
+
+FEEDBACK_THANK_YOU = (
+    "Спасибо за оценку! Будут вопросы — просто напишите."
+)
+
+FEEDBACK_NOT_RESOLVED_ACK = (
+    "Извините. Напишите здесь, что осталось нерешённым — разберёмся."
+)
+
+# Уведомления в топик саппорта
+TOPIC_NOTICE_RESOLVED = "✅ Клиент подтвердил, что вопрос решён"
+TOPIC_NOTICE_NOT_RESOLVED = "⚠️ Клиент говорит, что вопрос НЕ решён — нужен follow-up"
+
 # Calink API
 CALINK_API_URL = "https://calink.ru/api/hooks/support/user/info"
 CALINK_API_SECRET = os.getenv(

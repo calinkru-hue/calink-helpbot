@@ -71,8 +71,28 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_event_log_type
             ON event_log (event_type, created_at)
         """)
+        # Заявки на фидбек. Схема — подмножество feedback из zorion-helpbot
+        # (без email-полей: у Calink нет email-канала), чтобы запросы по
+        # оценкам работали одинаково на обоих ботах.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel         TEXT NOT NULL DEFAULT 'telegram',
+                telegram_user_id INTEGER,
+                topic_id        INTEGER NOT NULL,
+                rating          INTEGER,
+                sent_at         TEXT DEFAULT (datetime('now')),
+                rated_at        TEXT,
+                yes_clicked_at  TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_feedback_user
+            ON feedback (telegram_user_id, rated_at)
+        """)
         # Миграции для существующих таблиц
-        for col in ("last_auto_reply TEXT", "is_calink_user INTEGER DEFAULT 0", "card_message_id INTEGER"):
+        for col in ("last_auto_reply TEXT", "is_calink_user INTEGER DEFAULT 0", "card_message_id INTEGER",
+                    "last_support_reply_at TEXT", "last_user_message_at TEXT", "feedback_sent_at TEXT"):
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
             except Exception:
@@ -205,10 +225,153 @@ async def delete_message_mapping(group_message_id: int, topic_id: int):
         await db.commit()
 
 
+# ─── Фидбек ──────────────────────────────────
+
+# ВАЖНО про таймстемпы: все сравнения дат обёрнуты в SQLite datetime().
+# Python пишет '2026-08-04T12:00:00+00:00' (через T), а DEFAULT (datetime('now'))
+# пишет '2026-08-04 12:00:00' (через пробел). Пробел (0x20) сортируется РАНЬШЕ
+# 'T' (0x54), поэтому строковое сравнение колонок разного происхождения врёт.
+# На этом уже спотыкались в zorion-helpbot (reminder уходил через минуту вместо
+# пяти). datetime() приводит оба формата к одному виду.
+
+
+async def mark_support_reply(user_id: int):
+    """Обновить время последнего ответа саппорта — от него считается задержка
+    перед вопросом об оценке."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_support_reply_at = ? WHERE user_id = ?",
+            (now, user_id),
+        )
+        await db.commit()
+
+
+async def mark_user_message(user_id: int):
+    """Обновить время последнего сообщения клиента. Нужно, чтобы не просить
+    оценку, когда последнее слово за клиентом (мы ещё должны ответить)."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_user_message_at = ? WHERE user_id = ?",
+            (now, user_id),
+        )
+        await db.commit()
+
+
+async def mark_feedback_sent(user_id: int):
+    """Отметить, что вопрос об оценке отправлен (чтобы не спамить)."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET feedback_sent_at = ? WHERE user_id = ?",
+            (now, user_id),
+        )
+        await db.commit()
+
+
+async def users_due_for_feedback(threshold_iso: str) -> list[dict]:
+    """Юзеры, которым пора задать вопрос об оценке.
+
+    Все условия должны выполняться:
+      - саппорт хотя бы раз отвечал, и этот ответ старше порога
+      - вопрос либо не задавался, либо задавался ДО последнего ответа саппорта
+        (т.е. на новое обращение спросим снова)
+      - последнее слово в переписке за саппортом, а не за клиентом — иначе мы
+        сами ещё должны ответить, и спрашивать оценку рано
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, topic_id FROM users "
+            "WHERE last_support_reply_at IS NOT NULL "
+            "  AND datetime(last_support_reply_at) < datetime(?) "
+            "  AND (feedback_sent_at IS NULL "
+            "       OR datetime(feedback_sent_at) < datetime(last_support_reply_at)) "
+            "  AND (last_user_message_at IS NULL "
+            "       OR datetime(last_user_message_at) <= datetime(last_support_reply_at))",
+            (threshold_iso,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def save_feedback(topic_id: int, telegram_user_id: int) -> int:
+    """Создать строку заявки на фидбек. Возвращает id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO feedback (channel, telegram_user_id, topic_id) "
+            "VALUES ('telegram', ?, ?)",
+            (telegram_user_id, topic_id),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_unanswered_feedback(user_id: int) -> dict | None:
+    """Последняя заявка, на которую юзер ещё не ответил.
+
+    `rated_at IS NULL` — канонический признак «ответа не было»: клик «Нет»
+    ставит rated_at, не заполняя rating, поэтому проверять только rating нельзя.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, topic_id FROM feedback "
+            "WHERE telegram_user_id = ? AND rated_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def mark_feedback_yes_clicked(feedback_id: int) -> bool:
+    """Зафиксировать клик «Да, решён». Идемпотентно: срабатывает только когда
+    и yes_clicked_at, и rated_at пусты — повторные клики не плодят сообщения
+    в топике и не дают переобуться после выбора «Да»."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE feedback SET yes_clicked_at = ? "
+            "WHERE id = ? AND yes_clicked_at IS NULL AND rated_at IS NULL",
+            (now, feedback_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def mark_feedback_no_resolved(feedback_id: int) -> bool:
+    """Зафиксировать ответ «Нет, не решён»: ставит rated_at, rating остаётся
+    NULL. Идемпотентно и блокирует путь «Нет» после выбранного «Да»."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE feedback SET rated_at = ? "
+            "WHERE id = ? AND rated_at IS NULL AND yes_clicked_at IS NULL",
+            (now, feedback_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def update_feedback_rating(feedback_id: int, rating: int) -> bool:
+    """Поставить оценку. Идемпотентно: только если rated_at ещё пуст."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE feedback SET rating = ?, rated_at = ? "
+            "WHERE id = ? AND rated_at IS NULL",
+            (rating, now, feedback_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 # ─── Hard-reset юзера (dev/QA) ───────────────
 
 async def delete_user_by_topic(topic_id: int) -> int | None:
-    """Полностью стереть юзера, привязанного к топику, из всех 3 таблиц одной
+    """Полностью стереть юзера, привязанного к топику, из всех 4 таблиц одной
     транзакцией. Возвращает user_id (для отмены pending-джобов и логов) либо
     None, если топик не найден.
 
@@ -226,7 +389,9 @@ async def delete_user_by_topic(topic_id: int) -> int | None:
         if user_id is not None:
             await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM feedback WHERE telegram_user_id = ?", (user_id,))
         await db.execute("DELETE FROM messages WHERE topic_id = ?", (topic_id,))
+        await db.execute("DELETE FROM feedback WHERE topic_id = ?", (topic_id,))
         await db.execute("DELETE FROM event_log WHERE topic_id = ?", (topic_id,))
         await db.commit()
 
